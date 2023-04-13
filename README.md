@@ -387,5 +387,442 @@ Variable_name: innodb_log_buffer_size
 
 ### 2.4 Checkpoint 技术
 
+页的操作首先都是在缓冲池中完成的。如果一条 DML 语句，如 Update 或 Delete 改变了页中的记录，那么此时页是脏的，即缓冲池中的页的版本要比磁盘的新。数据库需要将新版本的页从缓冲池刷新到磁盘。
 
+倘若每次一个页发生变化，就将新页的版本刷新到磁盘，那么这个开销是非常大的。若热点数据集中在某几个页中，那么数据库的性能将变得非常差。同时，如果在从缓冲池将页的新版本刷新到磁盘时发生了宕机，那么数据就不能恢复了。
+
+为了避免发生数据丢失的问题，当前事务数据库系统普遍都采用了 **Write Ahead Log** 策略，即当事务提交时，先写重做日志，再修改页。当由于发生宕机而导致数据丢失时，通过重做日志来完成数据的恢复。这也是事务ACID中 D ( **Durability持久性**）的要求。
+
+
+
+如果重做日志可以无限地增大，同时缓冲池也足够大，能够缓冲所有数据库的数据，那么是不需要将缓冲池中页的新版本刷新回磁盘。因为当发生宕机时，完全可以通过重做日志来恢复整个数据库系统中的数据到宕机发生的时刻。但是这需要两个前提条件：
+
+*   缓冲池可以缓存数据库中所有的数据；
+*   重做日志可以无限增大。
+
+这明显是不现实的。
+
+
+
+因此 **Checkpoint (检查点）**技术的目的是解决以下几个问题：
+
+*   缩短数据库的恢复时间；
+*   缓冲池不够用时，将脏页刷新到磁盘；
+*   重做日志不可用时，刷新脏页。
+
+1)   当数据库发生宕机时，数据库不需要重做所有的日志，因为 Checkpoint 之前的页都已经刷新回磁盘。故数据库只需对 Checkpoint 后的重做日志进行恢复。这样就大大缩短了恢复的时间。
+2)   此外，当缓冲池不够用时，根据 LRU 算法会溢出最近最少使用的页，若此页为脏页，那么需要强制执行Checkpoint，将脏页也就是页的新版本刷回磁盘。
+3)   重做日志是循环使用的，因此需要强制产生 Checkpoint，将缓冲池中的页刷新到当前重做日志的位置，以产生可用的重做日志。
+
+
+
+### 2.5 Master Thread 工作方式
+
+
+
+### 2.6 InnoDB 关键特性
+
+InnoDB 存储引擎的关键特性包括：
+
+*   插入缓冲(Insert Buffer)
+*   两次写(Double Write)
+*   自适应哈希索引(Adaptive Hash Index)
+*   异步IO (Async IO)
+*   刷新邻接页(Flush Neighbor Page)
+
+### 2.7 启动、关闭与恢复
+
+
+
+## 第三章 文件
+
+本章将分析构成 MySQL 数据库和 InnoDB 存储引擎表的各种类型文件。这些文件有以下这些。
+
+*   参数文件：
+
+    告诉 MySQL 实例启动时在哪里可以找到数据库文件，并且指定某些初始化参数，这些参数定义了某种内存结构的大小等设置，还会介绍各种参数的类型。
+
+*   日志文件：
+
+    用来记录MySQL实例对某种条件做出响应时写入的文件，如错误日志文件、二进制日志文件、慢查询日志文件、查询日志文件等。
+
+*   socket文件：
+
+    当用UNIX域套接字方式进行连接时需要的文件。pid文件:MySQL实例的进程ID文件。
+
+*   MySQL表结构文件：
+
+    用来存放MySQL表结构定义文件。
+
+*   存储引擎文件：
+
+    因为MySQL表存储引擎的关系，每个存储引擎都会有自己的文件来保存各种数据。这些存储引擎真正存储了记录和索引等数据。本章主要介绍与InnoDB有关的存储引擎文件。
+
+### 3.1 参数文件
+
+当 MySQL 实例启动时，数据库会先去读一个配置参数文件，用来寻找数据库的各种文件所在位置以及指定某些初始化参数，这些参数通常定义了某种内存结构有多大等。在默认情况下，MySQL 实例会按照一定的顺序在指定的位置进行读取，用户只需通过命令 **`mysql--help | grep my.cnf`** 来寻找即可。
+
+MySQL 实例可以不需要参数文件，这时所有的参数值取决于编译 MySQL 时指定的默认值和源代码中指定参数的默认值。
+
+#### 3.1.1 什么是参数
+
+简单地说，可以把数据库参数看成一个 **键/值 (key/value) 对**。如 **`innodb_buffer_pool_size=1G`**.
+
+```mysql
+use information_schema;
+/*
+
+select * 
+from global_variables
+where variable_name like 'innodb_buffer%'\G; 	似乎有点问题
+
+*/
+
+show variables like 'innodb_buffer%'\G;			-- 推荐使用 show variables 命令，各版本都支持
+/*
+
+...
+*************************** 10. row ***************************
+Variable_name: innodb_buffer_pool_size
+        Value: 134217728
+
+*/
+```
+
+
+
+#### 3.1.2 参数类型
+
+MySQL数据库中的参数可以分为两类：
+
+*   动态（dynamic）参数
+*   静态(static）参数
+
+动态参数意味着可以在 MysQL 实例运行甲进行更改，**静态参数** 说明在整个实例生命周期内都不得进行更改，就好像是 **只读(read only)** 的。可以通过 **SET** 命令对动态的参数值进行修改，SET 的语法如下：
+
+```mysql
+set
+| [global | session] system_var_name = expr
+| [@@global. | @@session. | @@] system_var_name = expr
+```
+
+这里可以看到 global 和 session 关键字，它们表明该参数的修改是基于当前会话还是整个实例的生命周期。有些动态参数只能在会话中进行修改，如 autocommit；而有些参数修改完后，在整个实例生命周期中都会生效，如 binlog_cache_size；而有些参数既可以在会话中又可以在整个实例的生命周期内生效，如 read_buffer_size。
+
+```mysql
+select @@session.read_buffer_size\G;
+select @@global.read_buffer_size\G;
+
+/*
+
+*************************** 1. row ***************************
+@@session.read_buffer_size: 131072
+1 row in set (0.00 sec)
+
+*************************** 1. row ***************************
+@@global.read_buffer_size: 131072
+1 row in set (0.00 sec)
+
+*/
+
+set read_buffer_size=524288;
+
+/*
+
+*************************** 1. row ***************************
+@@session.read_buffer_size: 524288			当前会话的参数值变了，改成 512 KB
+1 row in set (0.00 sec)
+
+*************************** 1. row ***************************
+@@global.read_buffer_size: 131072			全局的值没变，还是 128 KB
+
+*/
+```
+
+也就是说如果有另一个会话登录到 MySQL 实例，它的 read_buffer_size 的值是 128 KB，而不是 512 KB。
+
+```mysql
+set @@global.read_buffer_size = 1048576;
+
+/*
+
+*************************** 1. row ***************************
+@@session.read_buffer_size: 524288			当前会话值没变
+1 row in set (0.00 sec)
+
+*************************** 1. row ***************************
+@@global.read_buffer_size: 1048576			全局值变成 1 MB
+1 row in set (0.00 sec)
+
+*/
+```
+
+这里需要注意的是，对变量的全局值进行了修改，在这次的 **实例生命周期内** 都有效，但 MySQL 实例本身并不会对参数文件中的该值进行修改。也就是说，在下次启动时 MySQL 实例还是会读取参数文件。若想在数据库实例下一次启动时该参数还是保留为当前修改的值，那么用户必须去修改参数文件。
+
+```mysql
+/*
+
+quit 重新登录
+
+*************************** 1. row ***************************
+@@session.read_buffer_size: 1048576
+1 row in set (0.00 sec)
+
+*************************** 1. row ***************************
+@@global.read_buffer_size: 1048576			都变成全局的值
+1 row in set (0.00 sec)
+
+reboot 重启
+
+*************************** 1. row ***************************
+@@session.read_buffer_size: 131072			都回来了
+1 row in set (0.00 sec)
+
+*************************** 1. row ***************************
+@@global.read_buffer_size: 131072
+1 row in set (0.00 sec)
+
+*/
+```
+
+
+
+对静态变量进行修改：
+
+```mysql
+set global datadir = '/db/mysql';
+
+/*
+
+ERROR 1238 (HY000): Variable 'datadir' is a read only variable		报错
+
+*/
+```
+
+
+
+### 3.2 日志文件
+
+日志文件记录了影响 MySQL 数据库的各种类型活动。MySQL 数据库中常见的日志文件有：
+
+*   错误日志 (error log) 
+*   二进制日志 (binlog)
+*   慢查询日志 (slow query log)
+*   查询日志 (log)
+
+
+
+#### 3.2.1 错误日志
+
+错误日志文件对 MySQL 的启动、运行、关闭过程进行了记录。MySQL DBA 在遇到问题时应该首先查看该文件以便定位问题。该文件不仅记录了所有的错误信息，也记录一些警告信息或正确的信息。用户可以通过命令**` SHOW VARIABLES LIKE 'log_error' `**来定位该文件，如：
+
+```mysql
+show variables like 'log_error'\G;
+
+/*
+
+*************************** 1. row ***************************
+Variable_name: log_error
+        Value: /var/log/mysql/error.log
+1 row in set (0.02 sec)
+
+2023-04-13T08:43:06.315330Z 3 [Note] Access denied for user 'root'@'localhost' (using password: YES)	输入错误密码连接数据库
+
+2023-04-13T08:45:25.808288Z 4 [Note] Access denied for user 'root'@'localhost' (using password: NO)		没有输入密码连接数据库
+
+*/
+show variables like 'log_timestamps%'\G;
+
+/*
+
+*************************** 1. row ***************************
+Variable_name: log_timestamps
+        Value: UTC				  UTC 时间
+1 row in set (0.00 sec)
+
+*/
+
+set global log_timestamps = system;		-- 修改成本地时间
+
+/*
+
+2023-04-13T19:29:44.210624+08:00 5 [Note] Access denied for user 'root'@'localhost' (using password: NO)					这个时间才对了啊
+
+配上文件
+/etc/mysql/mysql.conf.d/mysqld.cnf 里改
+
+*/
+
+```
+
+
+
+#### 3.2.2 慢查询日志
+
+**慢查询日志 (slow log）**可帮助 DBA 定位可能存在问题的 SQL 语句，从而进行 SQL 语句层面的优化。例如，可以在 MySQL 启动时设一个阈值，将运行时间超过该值的所有 SQL 语句都记录到慢查询日志文件中。DBA 每天或每过一段时间对其进行检查，确认是否有 SQL 语句需要进行优化。该阈值可以通过参数 **`long_query_time`** 来设置，默认值为 10，代表 10 秒。
+
+在默认情况下，MySQL数据库并不启动慢查询日志，用户需要手工将这个参数设为 ON：
+
+```mysql
+show variables like 'long_query_time'\G;
+
+/*
+
+*************************** 1. row ***************************
+Variable_name: long_query_time
+        Value: 10.000000			默认 10 秒
+1 row in set (0.01 sec)
+
+*/
+
+mysql> show variables like 'slow_query%';
+
+/*
+
++---------------------+------------------------------------+
+| Variable_name       | Value                              |
++---------------------+------------------------------------+
+| slow_query_log      | OFF                                |
+| slow_query_log_file | /var/lib/mysql/ubuntu1604-slow.log |
++---------------------+------------------------------------+
+2 rows in set (0.00 sec)
+
+默认慢查询是关的
+
+*/
+
+mysql> select * from mysql.slow_log;
+
+-- Empty set (0.01 sec)		没东西
+```
+
+
+
+```shell
+# 进不去 /var/lib/mysql/
+
+siuving@ubuntu1604:/var/lib$ ll | grep mysql
+
+
+# drwxr-x---  6 mysql         mysql         4096 4月  13 16:36 mysql/
+# drwxrwx---  2 mysql         mysql         4096 4月   7 22:07 mysql-files/
+# drwxr-x---  2 mysql         mysql         4096 4月   7 22:07 mysql-keyring/
+
+# 改一下权限
+
+siuving@ubuntu1604:/var/lib$ sudo chmod 777 mysql
+siuving@ubuntu1604:/var/lib$ ll | grep mysql
+
+# drwxrwxrwx  6 mysql         mysql         4096 4月  13 16:36 mysql/
+# drwxrwx---  2 mysql         mysql         4096 4月   7 22:07 mysql-files/
+# drwxr-x---  2 mysql         mysql         4096 4月   7 22:07 mysql-keyring/
+
+siuving@ubuntu1604:/var/lib/mysql$ ls
+# auto.cnf         ib_buffer_pool  mydb                server-cert.pem
+# ca-key.pem       ibdata1         mysql               server-key.pem
+# ca.pem           ib_logfile0     performance_schema  sys
+# client-cert.pem  ib_logfile1     private_key.pem
+# client-key.pem   ibtmp1          public_key.pem			里面也没东西啊 :(
+```
+
+
+
+#### 3.2.3 查询日志
+
+查询日志记录了所有对 MySQL 数据库请求的信息，无论这些请求是否得到了正确的执行。默认文件名为：**主机名.log**。如查看一个查询日志：
+
+```mysql
+mysql> show variables like 'general_log';
+
+/*
+
++---------------+-------+
+| Variable_name | Value |
++---------------+-------+
+| general_log   | OFF   |
++---------------+-------+
+1 row in set (0.00 sec)
+
+查询日志的记录存放的表，没开
+
+*/ 
+
+set global general_log = on;
+
+show variables like 'general_log_file';		-- 看看在哪
+
+/*
+
++------------------+-------------------------------+
+| Variable_name    | Value                         |
++------------------+-------------------------------+
+| general_log_file | /var/lib/mysql/ubuntu1604.log |
++------------------+-------------------------------+
+1 row in set (0.00 sec)
+
+
+2023-04-13T20:11:56.368245+08:00	    2 Query	show variables like 'general_log_file'
+2023-04-13T20:13:04.040212+08:00	    2 Query	show databases
+2023-04-13T20:13:10.396189+08:00	    2 Query	SELECT DATABASE()
+2023-04-13T20:13:10.408226+08:00	    2 Init DB	mydb
+2023-04-13T20:13:10.408850+08:00	    2 Query	show databases
+2023-04-13T20:13:10.409121+08:00	    2 Query	show tables
+2023-04-13T20:13:10.409272+08:00	    2 Field List	user 
+2023-04-13T20:13:21.368120+08:00	    2 Query	show tables
+2023-04-13T20:13:27.607998+08:00	    2 Query	select * from user	
+
+*/
+
+set global general_log = off;			-- 关了算了
+```
+
+
+
+#### 3.2.4 二进制日志
+
+**二进制日志（binary log）**记录了对 MySQL 数据库执行更改的所有操作，但是不包括 SELECT 和 SHOW 这类操作，因为这类操作对数据本身并没有修改。然而，若操作本身并没有导致数据库发生变化，那么该操作可能也会写入二进制日志。例如：
+
+```mysql
+create database test;
+create table users
+(
+    username char(20) not null ,
+    score int null
+);
+insert into users(username, score)
+values('siuving', 100);
+
+show mater status\G;		-- 没啥反应，单机有关？
+
+show variables like 'datadir';
+
+
+-- 有时间可以把这些过一遍
+```
+
+
+
+如果用户想记录 SELECT 和 SHOW 操作，那只能使用查询日志，而不是二进制日志。此外，二进制日志还包括了执行数据库更改操作的时间等其他额外信息。总的来说，二进制日志主要有以下几种作用：
+
+*   **恢复 (recovery)**：某些数据的恢复需要二进制日志，例如，在一个数据库全备文件恢复后，用户可以通过二进制日志进行 point-in-time 的恢复。
+*   **复制 (replication)**：其原理与恢复类似，通过复制和执行二进制日志使一台远程的 MySQL 数据库（一般称为slave 或 standby）与一台 MySQL 数据库（一般称为 master 或 primary）进行实时同步。
+*   **审计 (audit)**：用户可以通过二进制日志中的信息来进行审计，判断是否有对数据库进行注入的攻击。
+
+
+
+### 3.3 套接字文件
+
+前面提到过，在 UNIX 系统下本地连接 MySQL 可以采用 UNIX 域套接字方式，这种方式需要一个套接字（socket）文件。套接字文件可由参数 socket 控制。一般在 /tmp 目录下，名为 mysql.sock：
+
+```mysql
+mysql> show variables like 'socket'\G;
+
+/*
+
+*************************** 1. row ***************************
+Variable_name: socket
+        Value: /var/run/mysqld/mysqld.sock
+1 row in set (0.00 sec)
+
+*/
+```
 
